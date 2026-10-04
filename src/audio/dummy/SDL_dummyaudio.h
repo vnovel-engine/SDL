@@ -35,6 +35,8 @@ struct SDL_PrivateAudioData
     Uint32 mixlen;
     Uint32 write_delay;
     Uint32 initial_calls;
+    /* Pacing state: next callback deadline in performance-counter ticks. */
+    Uint64 next_deadline;
 };
 
 #endif /* SDL_dummyaudio_h_ */
