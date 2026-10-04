@@ -115,18 +115,26 @@ DUMMYAUDIO_GetDeviceBuf(_THIS)
 /* Pace the callback at real time like a real device: sleep until the next
  * buffer boundary using SDL's high-resolution performance counter.
  *
+ * The deadline is a running schedule advanced by one quantum each call, but it
+ * is clamped so it can never be skipped. A plain running deadline freewheels
+ * once a callback falls behind it: the sleep is skipped, the schedule falls
+ * further behind, and every later call skips too, so production runs away at
+ * the mixer's raw callback rate (measured on aarch64: ~52000 frames/s where
+ * 48000 is expected, with the surplus piling into the capture ring). Clamping
+ * a late deadline to now + step makes each call wait a full quantum, so a
+ * hitch costs at most its own duration and the long-run pace stays at the
+ * device rate.
+ *
  * SDL_Delay alone cannot do this on Windows: it resolves to the OS timer,
  * whose granularity ~15.6 ms is coarser than one quantum (21.33 ms at 1024
- * frames/48 kHz), so each sleep overshot to a whole tick and production fell
- * far short of real time (measured ~24000 frames/sec where 48000 is expected).
- * Driving the wait from SDL_GetPerformanceCounter and spinning out the last
- * millisecond holds the pace regardless of the OS tick. */
+ * frames/48 kHz), so the sleep can overshoot; the last millisecond is spun. */
 static void
 DUMMYAUDIO_WaitDevice(_THIS)
 {
     struct SDL_PrivateAudioData *dev = _this->hidden;
     const Uint64 freq = SDL_GetPerformanceFrequency();
     const Uint64 step = (Uint64) (((double) _this->spec.samples / _this->spec.freq) * freq);
+    const Uint64 spin = freq / 1000;   /* last 1 ms: spin, do not sleep */
     Uint64 now;
 
     if (dev == NULL || step == 0) {
@@ -134,24 +142,19 @@ DUMMYAUDIO_WaitDevice(_THIS)
     }
 
     now = SDL_GetPerformanceCounter();
-    if (dev->next_deadline == 0) {
-        dev->next_deadline = now;
-    }
     dev->next_deadline += step;
+    if (dev->next_deadline < now) {
+        /* Fell behind the schedule (a hitch, or a first call): resync to a full
+         * quantum from now instead of trying to catch up by freewheeling. */
+        dev->next_deadline = now + step;
+    }
 
-    if (now < dev->next_deadline) {
-        const Uint64 remain = dev->next_deadline - now;
-        const Uint64 spin = freq / 1000;   /* last 1 ms: spin, do not sleep */
-        if (remain > spin) {
-            SDL_Delay((Uint32) (((remain - spin) * 1000) / freq));
-        }
-        while (SDL_GetPerformanceCounter() < dev->next_deadline) {
-            SDL_Delay(0);   /* yield; last <=1 ms only */
-        }
-    } else if (now - dev->next_deadline > freq / 4) {
-        /* More than 250 ms behind (debugger, scheduling stall): do not try to
-         * catch up by freewheeling; restart the schedule from now. */
-        dev->next_deadline = now;
+    now = SDL_GetPerformanceCounter();
+    if (now + spin < dev->next_deadline) {
+        SDL_Delay((Uint32) (((dev->next_deadline - spin - now) * 1000) / freq));
+    }
+    while (SDL_GetPerformanceCounter() < dev->next_deadline) {
+        SDL_Delay(0);   /* yield; last <=1 ms only */
     }
 }
 
